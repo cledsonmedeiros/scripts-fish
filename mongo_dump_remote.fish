@@ -85,12 +85,13 @@ echo "✅ SSH por chave pronto."
 # =========================================================
 echo "➡️ Gerando dump no servidor remoto..."
 
-ssh $SSH_HOST_ALIAS "
+ssh $SSH_HOST_ALIAS "bash -c '
   set -e
   cd $REMOTE_BASE_PATH
   mongodump --uri=\"$REMOTE_MONGO_URI\" --db $DB_NAME -v -o ./$DUMP_DIR
-  tar -czf $TAR_FILE $DUMP_DIR
-"
+  echo \"📦 Compactando dump...\"
+  tar -czvf $TAR_FILE $DUMP_DIR
+'"
 
 # =========================================================
 # DOWNLOAD
@@ -109,8 +110,9 @@ end
 # =========================================================
 # DESCOMPACTAR LOCAL
 # =========================================================
+echo "📦 Descompactando dump localmente..."
 cd $LOCAL_BASE_PATH
-tar -xzf $TAR_FILE
+tar -xzvf $TAR_FILE
 
 # =========================================================
 # RESTORE LOCAL
