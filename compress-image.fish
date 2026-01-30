@@ -1,4 +1,4 @@
-#!/opt/homebrew/bin/fish
+#!/usr/bin/env fish
 
 function compress_image
     # Verifica se o ImageMagick está instalado

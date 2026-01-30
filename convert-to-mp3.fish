@@ -1,4 +1,4 @@
-#!/opt/homebrew/bin/fish
+#!/usr/bin/env fish
 
 function convert_to_mp3
     if test (count $argv) -ne 1
