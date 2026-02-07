@@ -1,4 +1,4 @@
-#!/opt/homebrew/bin/fish
+#!/usr/bin/env fish
 
 function convert_clean
     if test (count $argv) -ne 1
