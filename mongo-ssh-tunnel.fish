@@ -33,10 +33,6 @@ function on_interrupt --on-signal INT --on-signal TERM
     exit 0
 end
 
-function on_exit --on-event fish_exit
-    cleanup
-end
-
 # Aguarda a porta ficar disponível
 sleep 2
 if lsof -i :27018 -sTCP:LISTEN -t >/dev/null 2>&1
