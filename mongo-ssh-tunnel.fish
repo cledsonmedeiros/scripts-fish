@@ -5,6 +5,9 @@ echo "mongodb://cledson:Beta0411!@127.0.0.1:27018/rifashow?directConnection=true
 echo ""
 echo "Iniciando túnel SSH..."
 
+# Alias do ~/.ssh/config (fallback para manter compatibilidade).
+set ssh_target (set -q MONGO_SSH_TARGET; and echo $MONGO_SSH_TARGET; or echo acoes.cc)
+
 set existing_pid (lsof -i :27018 -sTCP:LISTEN -t 2>/dev/null)
 if test -n "$existing_pid"
     echo "✗ A porta 27018 já está em uso. PID: $existing_pid"
@@ -28,7 +31,7 @@ function cleanup
 end
 
 # Inicia o túnel e so vai para background depois de autenticar
-ssh -f -N -L 27018:127.0.0.1:27017 -p 6969 -o ServerAliveInterval=60 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes root@45.56.112.138
+ssh -f -N -L 27018:127.0.0.1:27017 -o ServerAliveInterval=60 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes $ssh_target
 
 function on_interrupt --on-signal INT --on-signal TERM
     echo ""

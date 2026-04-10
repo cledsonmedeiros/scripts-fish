@@ -3,11 +3,7 @@
 # ========================
 # CONFIGURACOES PADRAO
 # ========================
-set SSH_HOST_ALIAS rifashow-backup
-set REMOTE_USER root
-set REMOTE_HOST 45.56.112.138
-set REMOTE_PORT 6969
-set SSH_KEY_PATH "$HOME/.ssh/id_ed25519_rifashow_backup"
+set SSH_TARGET (set -q MONGO_SSH_TARGET; and echo $MONGO_SSH_TARGET; or echo acoes.cc)
 
 set REMOTE_MONGO_URI 'mongodb://cledson:Beta0411!@127.0.0.1/rifashow?directConnection=true&authSource=admin'
 set DB_NAME rifashow
@@ -48,47 +44,18 @@ function ensure_local_base
 end
 
 function ensure_ssh_ready
-    if not test -d ~/.ssh
-        mkdir -p ~/.ssh
-        chmod 700 ~/.ssh
-    end
-
-    if not test -f "$SSH_KEY_PATH"
-        echo "Gerando chave SSH dedicada..."
-        ssh-keygen -t ed25519 -f "$SSH_KEY_PATH"
-    end
-
-    set SSH_CONFIG "$HOME/.ssh/config"
-    if not test -f "$SSH_CONFIG"
-        touch "$SSH_CONFIG"
-        chmod 600 "$SSH_CONFIG"
-    end
-
-    if not grep -q "Host $SSH_HOST_ALIAS" "$SSH_CONFIG"
-        echo "Adicionando host SSH '$SSH_HOST_ALIAS' ao config..."
-        printf "\nHost %s\n  HostName %s\n  User %s\n  Port %s\n  IdentityFile %s\n  IdentitiesOnly yes\n" \
-            "$SSH_HOST_ALIAS" "$REMOTE_HOST" "$REMOTE_USER" "$REMOTE_PORT" "$SSH_KEY_PATH" >> "$SSH_CONFIG"
-    end
-
-    echo "Verificando autenticacao SSH por chave..."
-    ssh -o BatchMode=yes "$SSH_HOST_ALIAS" "echo ok" >/dev/null 2>&1
-    set SSH_OK $status
-
-    if test $SSH_OK -ne 0
-        echo "Copiando chave para o servidor (senha sera solicitada UMA vez)..."
-        ssh-copy-id -i "$SSH_KEY_PATH.pub" "$SSH_HOST_ALIAS"
-
-        ssh -o BatchMode=yes "$SSH_HOST_ALIAS" "echo ok" >/dev/null 2>&1
-        or begin
-            echo "Falha ao configurar SSH por chave. Abortando."
-            exit 1
-        end
+    echo "Verificando autenticacao SSH por alias: $SSH_TARGET"
+    ssh -o BatchMode=yes "$SSH_TARGET" "echo ok" >/dev/null 2>&1
+    or begin
+        echo "Falha ao autenticar via SSH usando '$SSH_TARGET'."
+        echo "Verifique sua entrada no ~/.ssh/config e a chave associada."
+        exit 1
     end
 end
 
 function run_remote_dump
     echo "Gerando dump no servidor remoto..."
-    ssh "$SSH_HOST_ALIAS" "set -e; cd '$REMOTE_BASE_PATH'; rm -rf '$DUMP_DIR' '$TAR_FILE'; mongodump --uri=\"$REMOTE_MONGO_URI\" --db '$DB_NAME' -o './$DUMP_DIR'; tar -czf '$TAR_FILE' '$DUMP_DIR'"
+    ssh "$SSH_TARGET" "cd '$REMOTE_BASE_PATH' && rm -rf '$DUMP_DIR' '$TAR_FILE' && mongodump --uri=\"$REMOTE_MONGO_URI\" --db '$DB_NAME' -o './$DUMP_DIR' && tar -czf '$TAR_FILE' '$DUMP_DIR'"
     or begin
         echo "Erro ao gerar dump remoto."
         exit 1
@@ -97,7 +64,7 @@ end
 
 function download_dump
     echo "Baixando dump para $LOCAL_BASE_PATH..."
-    scp "$SSH_HOST_ALIAS:$REMOTE_BASE_PATH/$TAR_FILE" "$LOCAL_BASE_PATH/"
+    scp "$SSH_TARGET:$REMOTE_BASE_PATH/$TAR_FILE" "$LOCAL_BASE_PATH/"
     or begin
         echo "Erro no download do dump."
         exit 1
@@ -114,7 +81,7 @@ function extract_dump
 end
 
 function remove_remote_artifacts
-    ssh "$SSH_HOST_ALIAS" "rm -rf '$REMOTE_BASE_PATH/$DUMP_DIR' '$REMOTE_BASE_PATH/$TAR_FILE'" >/dev/null 2>&1
+    ssh "$SSH_TARGET" "rm -rf '$REMOTE_BASE_PATH/$DUMP_DIR' '$REMOTE_BASE_PATH/$TAR_FILE'" >/dev/null 2>&1
 end
 
 function ask_yes
