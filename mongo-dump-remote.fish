@@ -15,6 +15,74 @@ set DATE (date +%Y-%m-%d)
 set DUMP_DIR "rifashow-$DATE"
 set TAR_FILE "$DUMP_DIR.tar.gz"
 
+function now_ts
+    date +%s
+end
+
+function elapsed_hms
+    set -l start_ts "$argv[1]"
+    set -l end_ts (now_ts)
+    set -l elapsed (math "$end_ts - $start_ts")
+    if test "$elapsed" -lt 0
+        set elapsed 0
+    end
+
+    set -l h (math -s0 "$elapsed / 3600")
+    set -l m (math -s0 "($elapsed % 3600) / 60")
+    set -l s (math -s0 "$elapsed % 60")
+    printf "%02d:%02d:%02d" $h $m $s
+end
+
+function file_size_bytes
+    set -l file "$argv[1]"
+
+    if test -f "$file"
+        set -l size (stat -f%z "$file" 2>/dev/null)
+        if test $status -eq 0 -a -n "$size"
+            echo "$size"
+            return 0
+        end
+
+        set size (stat -c%s "$file" 2>/dev/null)
+        if test $status -eq 0 -a -n "$size"
+            echo "$size"
+            return 0
+        end
+    end
+
+    echo ""
+    return 1
+end
+
+function extract_archive_with_progress
+    set -l archive_file "$argv[1]"
+    set -l output_dir "$argv[2]"
+
+    if not test -f "$archive_file"
+        return 1
+    end
+
+    set -l archive_size (file_size_bytes "$archive_file")
+
+    if type -q pv
+        if type -q pigz
+            if test -n "$archive_size"
+                pv -s "$archive_size" "$archive_file" | pigz -dc | tar -xf - -C "$output_dir"
+            else
+                pv "$archive_file" | pigz -dc | tar -xf - -C "$output_dir"
+            end
+        else
+            if test -n "$archive_size"
+                pv -s "$archive_size" "$archive_file" | tar -xzf - -C "$output_dir"
+            else
+                pv "$archive_file" | tar -xzf - -C "$output_dir"
+            end
+        end
+    else
+        tar -xzf "$archive_file" -C "$output_dir"
+    end
+end
+
 function print_usage
     echo "Uso:"
     echo "  mongo-dump-remote.fish full [--yes] [--restore-uri URI]"
@@ -53,31 +121,219 @@ function ensure_ssh_ready
     end
 end
 
+function check_local_tool
+    set -l tool_name "$argv[1]"
+    if type -q "$tool_name"
+        echo "  [OK] local: $tool_name"
+        return 0
+    end
+
+    echo "  [FALTA] local: $tool_name"
+    return 1
+end
+
+function check_remote_tool
+    set -l tool_name "$argv[1]"
+    ssh "$SSH_TARGET" "command -v '$tool_name' >/dev/null 2>&1"
+    if test $status -eq 0
+        echo "  [OK] remoto: $tool_name"
+        return 0
+    end
+
+    echo "  [FALTA] remoto: $tool_name"
+    return 1
+end
+
+function preflight_dump_remote
+    set -l missing 0
+
+    echo "Preflight (local):"
+    for t in ssh scp tar
+        check_local_tool "$t"
+        or set missing 1
+    end
+
+    if type -q rsync
+        echo "  [OK] local opcional: rsync (download mais rapido)"
+    else
+        echo "  [INFO] local opcional ausente: rsync (usando scp)"
+    end
+
+    if type -q pv
+        echo "  [OK] local opcional: pv (barra de progresso/ETA)"
+    else
+        echo "  [INFO] local opcional ausente: pv (sem barra detalhada)"
+    end
+
+    if type -q pigz
+        echo "  [OK] local opcional: pigz (descompactacao paralela)"
+    else
+        echo "  [INFO] local opcional ausente: pigz (usando gzip/tar padrao)"
+    end
+
+    ensure_ssh_ready
+
+    echo "Preflight (remoto):"
+    for t in mongodump tar du awk
+        check_remote_tool "$t"
+        or set missing 1
+    end
+
+    if ssh "$SSH_TARGET" "command -v pigz >/dev/null 2>&1"
+        echo "  [OK] remoto opcional: pigz (compactacao paralela)"
+    else
+        echo "  [INFO] remoto opcional ausente: pigz (fallback para gzip/tar)"
+    end
+
+    if ssh "$SSH_TARGET" "command -v pv >/dev/null 2>&1"
+        echo "  [OK] remoto opcional: pv (barra de progresso/ETA)"
+    else
+        echo "  [INFO] remoto opcional ausente: pv (sem barra detalhada)"
+    end
+
+    if test $missing -ne 0
+        echo ""
+        echo "Preflight falhou: faltam dependencias obrigatorias."
+        exit 1
+    end
+end
+
+function preflight_restore_local
+    set -l missing 0
+
+    echo "Preflight (local):"
+    for t in mongorestore tar
+        check_local_tool "$t"
+        or set missing 1
+    end
+
+    if type -q pv
+        echo "  [OK] local opcional: pv (barra de progresso/ETA)"
+    else
+        echo "  [INFO] local opcional ausente: pv (sem barra detalhada)"
+    end
+
+    if type -q pigz
+        echo "  [OK] local opcional: pigz (descompactacao paralela)"
+    else
+        echo "  [INFO] local opcional ausente: pigz (usando gzip/tar padrao)"
+    end
+
+    if test $missing -ne 0
+        echo ""
+        echo "Preflight falhou: faltam dependencias obrigatorias."
+        exit 1
+    end
+end
+
+function preflight_full
+    preflight_dump_remote
+
+    if type -q mongorestore
+        echo "  [OK] local opcional para full: mongorestore (restore local)"
+    else
+        echo "  [INFO] local opcional ausente para full: mongorestore"
+        echo "        Se voce escolher restaurar, esta etapa vai falhar."
+    end
+end
+
 function run_remote_dump
-    echo "Gerando dump no servidor remoto..."
-    ssh "$SSH_TARGET" "cd '$REMOTE_BASE_PATH' && rm -rf '$DUMP_DIR' '$TAR_FILE' && mongodump --uri=\"$REMOTE_MONGO_URI\" --db '$DB_NAME' -o './$DUMP_DIR' && tar -czf '$TAR_FILE' '$DUMP_DIR'"
+    echo "Gerando dump e compactando no servidor remoto (com progresso quando disponivel)..."
+    set -l started_at (now_ts)
+
+    begin
+        echo "set -e"
+        echo "cd '$REMOTE_BASE_PATH'"
+        echo "rm -rf '$DUMP_DIR' '$TAR_FILE'"
+        echo "echo '[1/3] Executando mongodump...'"
+        echo "mongodump --uri='$REMOTE_MONGO_URI' --db '$DB_NAME' -o './$DUMP_DIR'"
+        echo ""
+        echo "dump_size=\$(du -sb '$DUMP_DIR' 2>/dev/null | awk '{print \$1}')"
+        echo "if [ -n \"\$dump_size\" ]; then"
+        echo "    dump_size_gb=\$(awk -v s=\"\$dump_size\" 'BEGIN {printf \"%.2f\", s/1024/1024/1024}')"
+        echo "    printf '[2/3] Compactando dump - estimado bruto: %s bytes (%s GB)...\\n' \"\$dump_size\" \"\$dump_size_gb\""
+        echo "else"
+        echo "    echo '[2/3] Compactando dump - estimado bruto: desconhecido bytes...'"
+        echo "fi"
+        echo ""
+        echo "if command -v pigz >/dev/null 2>&1; then"
+        echo "    if command -v pv >/dev/null 2>&1 && [ -n \"\$dump_size\" ]; then"
+        echo "        tar -cf - '$DUMP_DIR' | pv -s \"\$dump_size\" | pigz -1 > '$TAR_FILE'"
+        echo "    else"
+        echo "        tar -cf - '$DUMP_DIR' | pigz -1 > '$TAR_FILE'"
+        echo "    fi"
+        echo "else"
+        echo "    if command -v pv >/dev/null 2>&1 && [ -n \"\$dump_size\" ]; then"
+        echo "        if command -v gzip >/dev/null 2>&1; then"
+        echo "            tar -cf - '$DUMP_DIR' | pv -s \"\$dump_size\" | gzip -1 > '$TAR_FILE'"
+        echo "        else"
+        echo "            tar -czf '$TAR_FILE' '$DUMP_DIR'"
+        echo "        fi"
+        echo "    else"
+        echo "        tar -czf '$TAR_FILE' '$DUMP_DIR'"
+        echo "    fi"
+        echo "fi"
+        echo ""
+        echo "tar_size=\$(du -h '$TAR_FILE' | awk '{print \$1}')"
+        echo "echo '[3/3] Compactacao finalizada:' '$TAR_FILE' \$tar_size"
+    end | ssh "$SSH_TARGET" sh
     or begin
         echo "Erro ao gerar dump remoto."
         exit 1
     end
+
+    echo "Dump remoto finalizado em "(elapsed_hms "$started_at")"."
 end
 
 function download_dump
-    echo "Baixando dump para $LOCAL_BASE_PATH..."
-    scp "$SSH_TARGET:$REMOTE_BASE_PATH/$TAR_FILE" "$LOCAL_BASE_PATH/"
-    or begin
+    echo "Baixando dump para $LOCAL_BASE_PATH (com progresso)..."
+    set -l started_at (now_ts)
+    set -l downloaded 0
+
+    if type -q rsync
+        # rsync nativo do macOS costuma ser antigo (2.6.x) e nao suporta --append-verify/--info=progress2.
+        if rsync --version 2>/dev/null | head -n 1 | grep -q 'version 3'
+            rsync -ah --partial --append-verify --info=progress2 --rsh="ssh -T -c aes128-gcm@openssh.com -o Compression=no" "$SSH_TARGET:$REMOTE_BASE_PATH/$TAR_FILE" "$LOCAL_BASE_PATH/$TAR_FILE"
+        else
+            rsync -ah --partial --progress --rsh="ssh -T -c aes128-gcm@openssh.com -o Compression=no" "$SSH_TARGET:$REMOTE_BASE_PATH/$TAR_FILE" "$LOCAL_BASE_PATH/$TAR_FILE"
+        end
+
+        if test $status -eq 0
+            set downloaded 1
+        else
+            echo "Rsync falhou. Tentando fallback com scp..."
+            scp -c aes128-gcm@openssh.com -o Compression=no "$SSH_TARGET:$REMOTE_BASE_PATH/$TAR_FILE" "$LOCAL_BASE_PATH/"
+            if test $status -eq 0
+                set downloaded 1
+            end
+        end
+    else
+        echo "Rsync indisponivel. Usando scp..."
+        scp -c aes128-gcm@openssh.com -o Compression=no "$SSH_TARGET:$REMOTE_BASE_PATH/$TAR_FILE" "$LOCAL_BASE_PATH/"
+        if test $status -eq 0
+            set downloaded 1
+        end
+    end
+
+    if test $downloaded -ne 1
         echo "Erro no download do dump."
         exit 1
     end
+
+    echo "Download finalizado em "(elapsed_hms "$started_at")"."
 end
 
 function extract_dump
     echo "Descompactando $TAR_FILE..."
-    tar -xzf "$LOCAL_BASE_PATH/$TAR_FILE" -C "$LOCAL_BASE_PATH"
+    set -l started_at (now_ts)
+
+    extract_archive_with_progress "$LOCAL_BASE_PATH/$TAR_FILE" "$LOCAL_BASE_PATH"
     or begin
         echo "Erro ao descompactar dump local."
         exit 1
     end
+
+    echo "Descompactacao finalizada em "(elapsed_hms "$started_at")"."
 end
 
 function remove_remote_artifacts
@@ -107,7 +363,7 @@ function resolve_restore_source
             if string match -rq '\.tar\.gz$' "$input_path"
                 set -l extracted_dir (path basename "$input_path" | string replace -r '\.tar\.gz$' '')
                 echo "Descompactando backup: $input_path"
-                tar -xzf "$input_path" -C "$LOCAL_BASE_PATH"
+                extract_archive_with_progress "$input_path" "$LOCAL_BASE_PATH"
                 or return 1
                 echo "$LOCAL_BASE_PATH/$extracted_dir"
                 return 0
@@ -181,7 +437,7 @@ set RESTORE_INPUT "$argv[1]"
 switch "$CMD"
     case full
         ensure_local_base
-        ensure_ssh_ready
+        preflight_full
         run_remote_dump
         download_dump
         extract_dump
@@ -208,7 +464,7 @@ switch "$CMD"
 
     case dump-remote
         ensure_local_base
-        ensure_ssh_ready
+        preflight_dump_remote
         run_remote_dump
         download_dump
 
@@ -222,6 +478,7 @@ switch "$CMD"
 
     case restore-local
         ensure_local_base
+        preflight_restore_local
         set -l restore_source (resolve_restore_source "$RESTORE_INPUT")
         or begin
             echo "Nao foi possivel identificar um backup para restore."
