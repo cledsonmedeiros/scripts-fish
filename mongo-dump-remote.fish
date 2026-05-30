@@ -10,6 +10,10 @@ set DB_NAME rifashow
 set REMOTE_BASE_PATH "/root"
 set LOCAL_BASE_PATH "$HOME/Downloads"
 set RESTORE_URI_DEFAULT "mongodb://localhost:27017"
+set S3_BUCKET_DEFAULT (set -q MONGO_S3_BUCKET; and echo $MONGO_S3_BUCKET; or echo "acoescc-dumps")
+set S3_REGION_DEFAULT (set -q MONGO_S3_REGION; and echo $MONGO_S3_REGION; or echo "sa-east-1")
+set S3_PREFIX_DEFAULT (set -q MONGO_S3_PREFIX; and echo $MONGO_S3_PREFIX; or echo "mongo-dumps")
+set S3_PRESIGN_TTL_DEFAULT (set -q MONGO_S3_PRESIGN_TTL; and echo $MONGO_S3_PRESIGN_TTL; or echo 7200)
 
 set DATE (date +%Y-%m-%d)
 set DUMP_DIR "rifashow-$DATE"
@@ -85,8 +89,8 @@ end
 
 function print_usage
     echo "Uso:"
-    echo "  mongo-dump-remote.fish full [--yes] [--restore-uri URI]"
-    echo "  mongo-dump-remote.fish dump-remote"
+    echo "  mongo-dump-remote.fish full [--yes] [--restore-uri URI] [--s3 ...]"
+    echo "  mongo-dump-remote.fish dump-remote [--s3 ...]"
     echo "  mongo-dump-remote.fish restore-local [CAMINHO_DUMP_OU_TAR] [--restore-uri URI]"
     echo ""
     echo "Comandos:"
@@ -97,12 +101,23 @@ function print_usage
     echo "Opcoes:"
     echo "  --yes, -y             Assume sim para prompts opcionais"
     echo "  --restore-uri=URI     URI de destino do mongorestore (padrao: $RESTORE_URI_DEFAULT)"
+    echo "  --s3                  Usa S3 como canal principal de transferencia (padrao: ativo)"
+    echo "  --s3-bucket=BUCKET    Bucket S3 (padrao: acoescc-dumps ou MONGO_S3_BUCKET)"
+    echo "  --s3-region=REGIAO    Regiao AWS (padrao: $S3_REGION_DEFAULT)"
+    echo "  --s3-prefix=PREFIXO   Prefixo S3 para objetos (padrao: $S3_PREFIX_DEFAULT)"
+    echo "  --s3-presign-download Baixa no local via URL pre-assinada + curl (padrao no modo --s3)"
+    echo "  --s3-aws-download     Forca download local via aws cli"
+    echo "  --s3-presign-ttl=SEG  TTL da URL pre-assinada (padrao: $S3_PRESIGN_TTL_DEFAULT)"
+    echo "  --keep-s3             Mantem objeto no S3 mesmo apos restore com sucesso"
     echo ""
     echo "Exemplos:"
     echo "  mongo-dump-remote.fish dump-remote"
+    echo "  mongo-dump-remote.fish dump-remote --s3 --s3-bucket=acoescc-dumps"
+    echo "  mongo-dump-remote.fish dump-remote --s3 --s3-bucket=acoescc-dumps --s3-presign-download"
     echo "  mongo-dump-remote.fish restore-local ~/Downloads/rifashow-2026-03-10"
     echo "  mongo-dump-remote.fish restore-local ~/Downloads/rifashow-2026-03-10.tar.gz"
     echo "  mongo-dump-remote.fish full --yes"
+    echo "  mongo-dump-remote.fish full --yes --s3 --s3-bucket=acoescc-dumps --s3-region=sa-east-1"
 end
 
 function ensure_local_base
@@ -142,6 +157,65 @@ function check_remote_tool
 
     echo "  [FALTA] remoto: $tool_name"
     return 1
+end
+
+function s3_object_key
+    set -l prefix (string trim -c '/' -- "$S3_PREFIX")
+    if test -n "$prefix"
+        echo "$prefix/$TAR_FILE"
+    else
+        echo "$TAR_FILE"
+    end
+end
+
+function s3_object_uri
+    set -l key (s3_object_key)
+    echo "s3://$S3_BUCKET/$key"
+end
+
+function preflight_s3_local
+    if test -z "$S3_BUCKET"
+        echo "Preflight S3 falhou: bucket nao informado. Use --s3-bucket ou MONGO_S3_BUCKET."
+        exit 1
+    end
+
+    if test $S3_USE_PRESIGN -eq 1
+        if type -q curl
+            echo "  [OK] local: curl (download via URL pre-assinada)"
+        else if type -q aws
+            echo "  [INFO] curl ausente; usando fallback para aws cli local"
+            set -g S3_USE_PRESIGN 0
+        else
+            echo "Preflight S3 local falhou: instale curl (modo padrao) ou aws cli local."
+            exit 1
+        end
+    end
+
+    if test $S3_USE_PRESIGN -eq 1
+        echo "  [OK] modo local: URL pre-assinada + curl"
+    else
+        check_local_tool aws
+        or exit 1
+        aws s3api head-bucket --bucket "$S3_BUCKET" --region "$S3_REGION" >/dev/null 2>&1
+        or begin
+            echo "Preflight S3 local falhou: sem acesso ao bucket '$S3_BUCKET' na regiao '$S3_REGION'."
+            exit 1
+        end
+        echo "  [OK] local: acesso ao bucket S3 confirmado"
+    end
+end
+
+function preflight_s3_remote
+    check_remote_tool aws
+    or exit 1
+
+    ssh "$SSH_TARGET" "aws s3api head-bucket --bucket '$S3_BUCKET' --region '$S3_REGION' >/dev/null 2>&1"
+    or begin
+        echo "Preflight S3 remoto falhou: sem acesso ao bucket '$S3_BUCKET' na regiao '$S3_REGION'."
+        exit 1
+    end
+
+    echo "  [OK] remoto: acesso ao bucket S3 confirmado"
 end
 
 function preflight_dump_remote
@@ -196,6 +270,12 @@ function preflight_dump_remote
         echo "Preflight falhou: faltam dependencias obrigatorias."
         exit 1
     end
+
+    if test $USE_S3 -eq 1
+        echo "Preflight (S3):"
+        preflight_s3_local
+        preflight_s3_remote
+    end
 end
 
 function preflight_restore_local
@@ -235,6 +315,114 @@ function preflight_full
         echo "  [INFO] local opcional ausente para full: mongorestore"
         echo "        Se voce escolher restaurar, esta etapa vai falhar."
     end
+end
+
+function upload_dump_to_s3_remote
+    set -l s3_uri (s3_object_uri)
+    echo "Enviando dump remoto para S3: $s3_uri"
+    set -l started_at (now_ts)
+
+    ssh "$SSH_TARGET" "aws s3 cp '$REMOTE_BASE_PATH/$TAR_FILE' '$s3_uri' --region '$S3_REGION'"
+    or begin
+        echo "Falha no upload para S3. O script vai tentar fallback de download direto por SSH."
+        return 1
+    end
+
+    echo "Upload para S3 finalizado em "(elapsed_hms "$started_at")"."
+    return 0
+end
+
+function download_dump_ssh
+    set -l downloaded 0
+
+    if type -q rsync
+        # rsync nativo do macOS costuma ser antigo (2.6.x) e nao suporta --append-verify/--info=progress2.
+        if rsync --version 2>/dev/null | head -n 1 | grep -q 'version 3'
+            rsync -ah --partial --append-verify --info=progress2 --rsh="ssh -T -c aes128-gcm@openssh.com -o Compression=no" "$SSH_TARGET:$REMOTE_BASE_PATH/$TAR_FILE" "$LOCAL_BASE_PATH/$TAR_FILE"
+        else
+            rsync -ah --partial --progress --rsh="ssh -T -c aes128-gcm@openssh.com -o Compression=no" "$SSH_TARGET:$REMOTE_BASE_PATH/$TAR_FILE" "$LOCAL_BASE_PATH/$TAR_FILE"
+        end
+
+        if test $status -eq 0
+            set downloaded 1
+        else
+            echo "Rsync falhou. Tentando fallback com scp..."
+            scp -c aes128-gcm@openssh.com -o Compression=no "$SSH_TARGET:$REMOTE_BASE_PATH/$TAR_FILE" "$LOCAL_BASE_PATH/"
+            if test $status -eq 0
+                set downloaded 1
+            end
+        end
+    else
+        echo "Rsync indisponivel. Usando scp..."
+        scp -c aes128-gcm@openssh.com -o Compression=no "$SSH_TARGET:$REMOTE_BASE_PATH/$TAR_FILE" "$LOCAL_BASE_PATH/"
+        if test $status -eq 0
+            set downloaded 1
+        end
+    end
+
+    if test $downloaded -ne 1
+        return 1
+    end
+
+    return 0
+end
+
+function download_dump_s3
+    set -l s3_uri (s3_object_uri)
+
+    if test $S3_USE_PRESIGN -eq 1
+        echo "Baixando do S3 via URL pre-assinada (curl com progresso): $s3_uri"
+
+        set -l presign_url (ssh "$SSH_TARGET" "aws s3 presign '$s3_uri' --region '$S3_REGION' --expires-in '$S3_PRESIGN_TTL'")
+        or begin
+            echo "Falha ao gerar URL pre-assinada no servidor remoto."
+            return 1
+        end
+
+        set presign_url (string trim -- "$presign_url")
+        if test -z "$presign_url"
+            echo "URL pre-assinada vazia."
+            return 1
+        end
+
+        curl -fL --progress-bar "$presign_url" -o "$LOCAL_BASE_PATH/$TAR_FILE"
+        or return 1
+    else
+        if type -q aws
+            echo "Baixando do S3 via aws cli (com progresso): $s3_uri"
+            aws s3 cp "$s3_uri" "$LOCAL_BASE_PATH/$TAR_FILE" --region "$S3_REGION"
+            or return 1
+        else
+            if not type -q curl
+                echo "Sem aws cli local e sem curl para modo presign."
+                return 1
+            end
+
+            echo "aws cli local nao encontrado. Tentando URL pre-assinada + curl..."
+            set -l presign_url_auto (ssh "$SSH_TARGET" "aws s3 presign '$s3_uri' --region '$S3_REGION' --expires-in '$S3_PRESIGN_TTL'")
+            or return 1
+
+            set presign_url_auto (string trim -- "$presign_url_auto")
+            test -n "$presign_url_auto"
+            or return 1
+
+            curl -fL --progress-bar "$presign_url_auto" -o "$LOCAL_BASE_PATH/$TAR_FILE"
+            or return 1
+        end
+    end
+
+    return 0
+end
+
+function remove_s3_object
+    set -l s3_uri (s3_object_uri)
+    echo "Removendo objeto temporario no S3: $s3_uri"
+    ssh "$SSH_TARGET" "aws s3 rm '$s3_uri' --region '$S3_REGION'"
+    or begin
+        echo "Falha ao remover objeto S3 temporario: $s3_uri"
+        return 1
+    end
+    return 0
 end
 
 function run_remote_dump
@@ -288,35 +476,28 @@ end
 function download_dump
     echo "Baixando dump para $LOCAL_BASE_PATH (com progresso)..."
     set -l started_at (now_ts)
-    set -l downloaded 0
+    set -l downloaded_ok 0
 
-    if type -q rsync
-        # rsync nativo do macOS costuma ser antigo (2.6.x) e nao suporta --append-verify/--info=progress2.
-        if rsync --version 2>/dev/null | head -n 1 | grep -q 'version 3'
-            rsync -ah --partial --append-verify --info=progress2 --rsh="ssh -T -c aes128-gcm@openssh.com -o Compression=no" "$SSH_TARGET:$REMOTE_BASE_PATH/$TAR_FILE" "$LOCAL_BASE_PATH/$TAR_FILE"
-        else
-            rsync -ah --partial --progress --rsh="ssh -T -c aes128-gcm@openssh.com -o Compression=no" "$SSH_TARGET:$REMOTE_BASE_PATH/$TAR_FILE" "$LOCAL_BASE_PATH/$TAR_FILE"
-        end
-
+    if test $USE_S3 -eq 1
+        download_dump_s3
         if test $status -eq 0
-            set downloaded 1
+            set downloaded_ok 1
         else
-            echo "Rsync falhou. Tentando fallback com scp..."
-            scp -c aes128-gcm@openssh.com -o Compression=no "$SSH_TARGET:$REMOTE_BASE_PATH/$TAR_FILE" "$LOCAL_BASE_PATH/"
+            echo "Download via S3 falhou. Tentando fallback por rsync/scp..."
+            download_dump_ssh
             if test $status -eq 0
-                set downloaded 1
+                set downloaded_ok 1
             end
         end
     else
-        echo "Rsync indisponivel. Usando scp..."
-        scp -c aes128-gcm@openssh.com -o Compression=no "$SSH_TARGET:$REMOTE_BASE_PATH/$TAR_FILE" "$LOCAL_BASE_PATH/"
+        download_dump_ssh
         if test $status -eq 0
-            set downloaded 1
+            set downloaded_ok 1
         end
     end
 
-    if test $downloaded -ne 1
-        echo "Erro no download do dump."
+    if test $downloaded_ok -ne 1
+        echo "Erro no download do dump (S3 e fallback SSH)."
         exit 1
     end
 
@@ -411,7 +592,7 @@ if test (count $argv) -gt 0
     end
 end
 
-argparse 'y/yes' 'restore-uri=' 'h/help' -- $argv
+argparse 'y/yes' 'restore-uri=' 'h/help' 's3' 's3-bucket=' 's3-region=' 's3-prefix=' 's3-presign-download' 's3-aws-download' 's3-presign-ttl=' 'keep-s3' -- $argv
 or begin
     print_usage
     exit 1
@@ -432,6 +613,56 @@ if set -q _flag_restore_uri
     set RESTORE_URI "$_flag_restore_uri"
 end
 
+set USE_S3 1
+if set -q _flag_s3
+    set USE_S3 1
+end
+
+set S3_BUCKET "$S3_BUCKET_DEFAULT"
+if set -q _flag_s3_bucket
+    set S3_BUCKET "$_flag_s3_bucket"
+end
+
+set S3_REGION "$S3_REGION_DEFAULT"
+if set -q _flag_s3_region
+    set S3_REGION "$_flag_s3_region"
+end
+
+set S3_PREFIX "$S3_PREFIX_DEFAULT"
+if set -q _flag_s3_prefix
+    set S3_PREFIX "$_flag_s3_prefix"
+end
+
+set S3_PRESIGN_TTL "$S3_PRESIGN_TTL_DEFAULT"
+if set -q _flag_s3_presign_ttl
+    set S3_PRESIGN_TTL "$_flag_s3_presign_ttl"
+end
+
+set S3_USE_PRESIGN 1
+if set -q _flag_s3_presign_download
+    set S3_USE_PRESIGN 1
+end
+if set -q _flag_s3_aws_download
+    set S3_USE_PRESIGN 0
+end
+
+set KEEP_S3 0
+if set -q _flag_keep_s3
+    set KEEP_S3 1
+end
+
+if test $USE_S3 -eq 1
+    if test -z "$S3_BUCKET"
+        echo "Modo S3 ativo, mas bucket vazio. Use --s3-bucket ou MONGO_S3_BUCKET."
+        exit 1
+    end
+    if test $S3_USE_PRESIGN -eq 1
+        echo "Modo S3 ativo: bucket=$S3_BUCKET regiao=$S3_REGION prefixo=$S3_PREFIX download=presign+curl"
+    else
+        echo "Modo S3 ativo: bucket=$S3_BUCKET regiao=$S3_REGION prefixo=$S3_PREFIX download=aws-cli"
+    end
+end
+
 set RESTORE_INPUT "$argv[1]"
 
 switch "$CMD"
@@ -439,8 +670,15 @@ switch "$CMD"
         ensure_local_base
         preflight_full
         run_remote_dump
+
+        if test $USE_S3 -eq 1
+            upload_dump_to_s3_remote
+        end
+
         download_dump
         extract_dump
+
+        set -l restored_success 0
 
         if test $AUTO_YES -eq 1
             remove_remote_artifacts
@@ -450,8 +688,14 @@ switch "$CMD"
 
         if test $AUTO_YES -eq 1
             run_restore "$LOCAL_BASE_PATH/$DUMP_DIR" "$RESTORE_URI"
+            set restored_success 1
         else if ask_yes "Restaurar dump localmente?"
             run_restore "$LOCAL_BASE_PATH/$DUMP_DIR" "$RESTORE_URI"
+            set restored_success 1
+        end
+
+        if test $USE_S3 -eq 1; and test $restored_success -eq 1; and test $KEEP_S3 -ne 1
+            remove_s3_object
         end
 
         if test $AUTO_YES -eq 1
@@ -466,6 +710,11 @@ switch "$CMD"
         ensure_local_base
         preflight_dump_remote
         run_remote_dump
+
+        if test $USE_S3 -eq 1
+            upload_dump_to_s3_remote
+        end
+
         download_dump
 
         if test $AUTO_YES -eq 1
@@ -474,7 +723,12 @@ switch "$CMD"
             remove_remote_artifacts
         end
 
-        echo "Dump remoto concluido. Arquivo local: $LOCAL_BASE_PATH/$TAR_FILE"
+        if test $USE_S3 -eq 1
+            echo "Dump remoto concluido. Arquivo local: $LOCAL_BASE_PATH/$TAR_FILE"
+            echo "Objeto S3: "(s3_object_uri)
+        else
+            echo "Dump remoto concluido. Arquivo local: $LOCAL_BASE_PATH/$TAR_FILE"
+        end
 
     case restore-local
         ensure_local_base
