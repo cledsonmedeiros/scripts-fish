@@ -369,9 +369,41 @@ end
 
 function download_dump_s3
     set -l s3_uri (s3_object_uri)
+    set -l local_file "$LOCAL_BASE_PATH/$TAR_FILE"
+
+    function _download_url_with_fallback --no-scope-shadowing
+        set -l url "$argv[1]"
+        set -l output_file "$argv[2]"
+
+        if type -q aria2c
+            set -l split (set -q MONGO_S3_DOWNLOAD_SPLIT; and echo $MONGO_S3_DOWNLOAD_SPLIT; or echo 16)
+            set -l min_split_size (set -q MONGO_S3_DOWNLOAD_MIN_SPLIT; and echo $MONGO_S3_DOWNLOAD_MIN_SPLIT; or echo 16M)
+
+            echo "Baixando via aria2c (multiconexao: -x$split -s$split, min-split-size=$min_split_size)..."
+            aria2c \
+                --console-log-level=warn \
+                --summary-interval=1 \
+                --allow-overwrite=true \
+                --file-allocation=none \
+                -x "$split" \
+                -s "$split" \
+                -k "$min_split_size" \
+                -o "$TAR_FILE" \
+                -d "$LOCAL_BASE_PATH" \
+                "$url"
+            and return 0
+
+            echo "aria2c falhou. Tentando fallback com curl..."
+        end
+
+        curl -fL --progress-bar "$url" -o "$output_file"
+        or return 1
+
+        return 0
+    end
 
     if test $S3_USE_PRESIGN -eq 1
-        echo "Baixando do S3 via URL pre-assinada (curl com progresso): $s3_uri"
+        echo "Baixando do S3 via URL pre-assinada: $s3_uri"
 
         set -l presign_url (ssh "$SSH_TARGET" "aws s3 presign '$s3_uri' --region '$S3_REGION' --expires-in '$S3_PRESIGN_TTL'")
         or begin
@@ -385,20 +417,27 @@ function download_dump_s3
             return 1
         end
 
-        curl -fL --progress-bar "$presign_url" -o "$LOCAL_BASE_PATH/$TAR_FILE"
+        _download_url_with_fallback "$presign_url" "$local_file"
         or return 1
     else
         if type -q aws
             echo "Baixando do S3 via aws cli (com progresso): $s3_uri"
-            aws s3 cp "$s3_uri" "$LOCAL_BASE_PATH/$TAR_FILE" --region "$S3_REGION"
+            aws s3 cp "$s3_uri" "$local_file" --region "$S3_REGION"
             or return 1
         else
             if not type -q curl
-                echo "Sem aws cli local e sem curl para modo presign."
-                return 1
+                if not type -q aria2c
+                    echo "Sem aws cli local e sem cliente HTTP (curl/aria2c) para modo presign."
+                    return 1
+                end
             end
 
-            echo "aws cli local nao encontrado. Tentando URL pre-assinada + curl..."
+            if not type -q curl; and type -q aria2c
+                echo "curl local nao encontrado. Usando aria2c no modo presign."
+            else
+                echo "aws cli local nao encontrado. Tentando URL pre-assinada..."
+            end
+
             set -l presign_url_auto (ssh "$SSH_TARGET" "aws s3 presign '$s3_uri' --region '$S3_REGION' --expires-in '$S3_PRESIGN_TTL'")
             or return 1
 
@@ -406,10 +445,12 @@ function download_dump_s3
             test -n "$presign_url_auto"
             or return 1
 
-            curl -fL --progress-bar "$presign_url_auto" -o "$LOCAL_BASE_PATH/$TAR_FILE"
+            _download_url_with_fallback "$presign_url_auto" "$local_file"
             or return 1
         end
     end
+
+    functions -e _download_url_with_fallback >/dev/null 2>&1
 
     return 0
 end
