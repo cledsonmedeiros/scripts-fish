@@ -37,6 +37,55 @@ function elapsed_hms
     printf "%02d:%02d:%02d" $h $m $s
 end
 
+function report_init
+    set -g FLOW_STARTED_AT (now_ts)
+    set -g FLOW_HAS_ERRORS 0
+    set -g FLOW_REPORT_LINES
+end
+
+function report_add_step
+    set -l step_state "$argv[1]"
+    set -l label "$argv[2]"
+    set -l started_at "$argv[3]"
+    set -l detail ""
+    if test (count $argv) -ge 4
+        set detail "$argv[4]"
+    end
+
+    set -l elapsed (elapsed_hms "$started_at")
+    set -g FLOW_REPORT_LINES $FLOW_REPORT_LINES "$step_state\t$label\t$elapsed\t$detail"
+
+    if test "$step_state" = "ERRO"
+        set -g FLOW_HAS_ERRORS 1
+    end
+end
+
+function print_execution_report
+    echo ""
+    echo "Relatorio de execucao:"
+
+    for row in $FLOW_REPORT_LINES
+        set -l parts (string split -m 3 "\t" -- "$row")
+        set -l step_state "$parts[1]"
+        set -l label "$parts[2]"
+        set -l elapsed "$parts[3]"
+        set -l detail "$parts[4]"
+
+        if test -n "$detail"
+            echo "  [$step_state] $label - $elapsed - $detail"
+        else
+            echo "  [$step_state] $label - $elapsed"
+        end
+    end
+
+    echo "Tempo total: "(elapsed_hms "$FLOW_STARTED_AT")
+    if test "$FLOW_HAS_ERRORS" -eq 1
+        echo "Resultado: concluido com erros/avisos."
+    else
+        echo "Resultado: concluido com sucesso."
+    end
+end
+
 function file_size_bytes
     set -l file "$argv[1]"
 
@@ -458,7 +507,26 @@ end
 function remove_s3_object
     set -l s3_uri (s3_object_uri)
     echo "Removendo objeto temporario no S3: $s3_uri"
-    ssh "$SSH_TARGET" "aws s3 rm '$s3_uri' --region '$S3_REGION'"
+
+    set -l auth_check (ssh "$SSH_TARGET" "aws sts get-caller-identity --region '$S3_REGION' 2>&1")
+    if test $status -ne 0
+        echo "Falha de autenticacao AWS no servidor remoto antes da remocao do objeto."
+        echo "$auth_check"
+        echo "Dica: renove a autenticacao AWS no remoto (ex.: aws sso login) ou ajuste credenciais/perfil."
+        return 1
+    end
+
+    set -l rm_output (ssh "$SSH_TARGET" "aws s3 rm '$s3_uri' --region '$S3_REGION' 2>&1")
+    if test $status -eq 0
+        return 0
+    end
+
+    echo "$rm_output"
+    if string match -qi "*CreateOAuth2Token*authorization grant is invalid*" -- "$rm_output"
+        echo "Motivo provavel: token OAuth2/SSO AWS expirado, revogado ou malformado no host remoto."
+        echo "Acao recomendada: executar aws sso login (no usuario remoto usado pelo SSH) e tentar novamente."
+    end
+
     or begin
         echo "Falha ao remover objeto S3 temporario: $s3_uri"
         return 1
@@ -692,6 +760,8 @@ if set -q _flag_keep_s3
     set KEEP_S3 1
 end
 
+report_init
+
 if test $USE_S3 -eq 1
     if test -z "$S3_BUCKET"
         echo "Modo S3 ativo, mas bucket vazio. Use --s3-bucket ou MONGO_S3_BUCKET."
@@ -708,60 +778,208 @@ set RESTORE_INPUT "$argv[1]"
 
 switch "$CMD"
     case full
+        set -l step_started (now_ts)
         ensure_local_base
-        preflight_full
-        run_remote_dump
-
-        if test $USE_S3 -eq 1
-            upload_dump_to_s3_remote
+        if test $status -eq 0
+            report_add_step "OK" "Preparar diretorio local" "$step_started"
+        else
+            report_add_step "ERRO" "Preparar diretorio local" "$step_started"
+            print_execution_report
+            exit 1
         end
 
+        set step_started (now_ts)
+        preflight_full
+        if test $status -eq 0
+            report_add_step "OK" "Preflight full" "$step_started"
+        else
+            report_add_step "ERRO" "Preflight full" "$step_started"
+            print_execution_report
+            exit 1
+        end
+
+        set step_started (now_ts)
+        run_remote_dump
+        if test $status -eq 0
+            report_add_step "OK" "Dump remoto" "$step_started"
+        else
+            report_add_step "ERRO" "Dump remoto" "$step_started"
+            print_execution_report
+            exit 1
+        end
+
+        if test $USE_S3 -eq 1
+            set step_started (now_ts)
+            upload_dump_to_s3_remote
+            if test $status -eq 0
+                report_add_step "OK" "Upload para S3" "$step_started"
+            else
+                report_add_step "ERRO" "Upload para S3" "$step_started" "fallback via SSH habilitado"
+            end
+        end
+
+        set step_started (now_ts)
         download_dump
+        if test $status -eq 0
+            report_add_step "OK" "Download do dump" "$step_started"
+        else
+            report_add_step "ERRO" "Download do dump" "$step_started"
+            print_execution_report
+            exit 1
+        end
+
+        set step_started (now_ts)
         extract_dump
+        if test $status -eq 0
+            report_add_step "OK" "Extracao local" "$step_started"
+        else
+            report_add_step "ERRO" "Extracao local" "$step_started"
+            print_execution_report
+            exit 1
+        end
 
         set -l restored_success 0
 
         if test $AUTO_YES -eq 1
+            set step_started (now_ts)
             remove_remote_artifacts
+            if test $status -eq 0
+                report_add_step "OK" "Remocao de artefatos remotos" "$step_started"
+            else
+                report_add_step "ERRO" "Remocao de artefatos remotos" "$step_started"
+            end
         else if ask_yes "Remover dump do servidor remoto?"
+            set step_started (now_ts)
             remove_remote_artifacts
+            if test $status -eq 0
+                report_add_step "OK" "Remocao de artefatos remotos" "$step_started"
+            else
+                report_add_step "ERRO" "Remocao de artefatos remotos" "$step_started"
+            end
         end
 
         if test $AUTO_YES -eq 1
+            set step_started (now_ts)
             run_restore "$LOCAL_BASE_PATH/$DUMP_DIR" "$RESTORE_URI"
             set restored_success 1
+            if test $status -eq 0
+                report_add_step "OK" "Restore local" "$step_started"
+            else
+                report_add_step "ERRO" "Restore local" "$step_started"
+                print_execution_report
+                exit 1
+            end
         else if ask_yes "Restaurar dump localmente?"
+            set step_started (now_ts)
             run_restore "$LOCAL_BASE_PATH/$DUMP_DIR" "$RESTORE_URI"
             set restored_success 1
+            if test $status -eq 0
+                report_add_step "OK" "Restore local" "$step_started"
+            else
+                report_add_step "ERRO" "Restore local" "$step_started"
+                print_execution_report
+                exit 1
+            end
         end
 
         if test $USE_S3 -eq 1; and test $restored_success -eq 1; and test $KEEP_S3 -ne 1
+            set step_started (now_ts)
             remove_s3_object
+            if test $status -eq 0
+                report_add_step "OK" "Remocao do objeto S3" "$step_started"
+            else
+                report_add_step "ERRO" "Remocao do objeto S3" "$step_started"
+            end
         end
 
         if test $AUTO_YES -eq 1
+            set step_started (now_ts)
             rm -rf "$LOCAL_BASE_PATH/$DUMP_DIR" "$LOCAL_BASE_PATH/$TAR_FILE"
+            if test $status -eq 0
+                report_add_step "OK" "Limpeza local" "$step_started"
+            else
+                report_add_step "ERRO" "Limpeza local" "$step_started"
+            end
         else if ask_yes "Remover dump local (pasta e tar.gz)?"
+            set step_started (now_ts)
             rm -rf "$LOCAL_BASE_PATH/$DUMP_DIR" "$LOCAL_BASE_PATH/$TAR_FILE"
+            if test $status -eq 0
+                report_add_step "OK" "Limpeza local" "$step_started"
+            else
+                report_add_step "ERRO" "Limpeza local" "$step_started"
+            end
         end
 
         echo "Backup finalizado com sucesso."
+        print_execution_report
 
     case dump-remote
+        set -l step_started (now_ts)
         ensure_local_base
-        preflight_dump_remote
-        run_remote_dump
-
-        if test $USE_S3 -eq 1
-            upload_dump_to_s3_remote
+        if test $status -eq 0
+            report_add_step "OK" "Preparar diretorio local" "$step_started"
+        else
+            report_add_step "ERRO" "Preparar diretorio local" "$step_started"
+            print_execution_report
+            exit 1
         end
 
+        set step_started (now_ts)
+        preflight_dump_remote
+        if test $status -eq 0
+            report_add_step "OK" "Preflight dump-remote" "$step_started"
+        else
+            report_add_step "ERRO" "Preflight dump-remote" "$step_started"
+            print_execution_report
+            exit 1
+        end
+
+        set step_started (now_ts)
+        run_remote_dump
+        if test $status -eq 0
+            report_add_step "OK" "Dump remoto" "$step_started"
+        else
+            report_add_step "ERRO" "Dump remoto" "$step_started"
+            print_execution_report
+            exit 1
+        end
+
+        if test $USE_S3 -eq 1
+            set step_started (now_ts)
+            upload_dump_to_s3_remote
+            if test $status -eq 0
+                report_add_step "OK" "Upload para S3" "$step_started"
+            else
+                report_add_step "ERRO" "Upload para S3" "$step_started" "fallback via SSH habilitado"
+            end
+        end
+
+        set step_started (now_ts)
         download_dump
+        if test $status -eq 0
+            report_add_step "OK" "Download do dump" "$step_started"
+        else
+            report_add_step "ERRO" "Download do dump" "$step_started"
+            print_execution_report
+            exit 1
+        end
 
         if test $AUTO_YES -eq 1
+            set step_started (now_ts)
             remove_remote_artifacts
+            if test $status -eq 0
+                report_add_step "OK" "Remocao de artefatos remotos" "$step_started"
+            else
+                report_add_step "ERRO" "Remocao de artefatos remotos" "$step_started"
+            end
         else if ask_yes "Remover dump do servidor remoto?"
+            set step_started (now_ts)
             remove_remote_artifacts
+            if test $status -eq 0
+                report_add_step "OK" "Remocao de artefatos remotos" "$step_started"
+            else
+                report_add_step "ERRO" "Remocao de artefatos remotos" "$step_started"
+            end
         end
 
         if test $USE_S3 -eq 1
@@ -770,19 +988,51 @@ switch "$CMD"
         else
             echo "Dump remoto concluido. Arquivo local: $LOCAL_BASE_PATH/$TAR_FILE"
         end
+        print_execution_report
 
     case restore-local
+        set -l step_started (now_ts)
         ensure_local_base
-        preflight_restore_local
-        set -l restore_source (resolve_restore_source "$RESTORE_INPUT")
-        or begin
-            echo "Nao foi possivel identificar um backup para restore."
-            echo "Informe um diretorio ou arquivo .tar.gz."
+        if test $status -eq 0
+            report_add_step "OK" "Preparar diretorio local" "$step_started"
+        else
+            report_add_step "ERRO" "Preparar diretorio local" "$step_started"
+            print_execution_report
             exit 1
         end
 
+        set step_started (now_ts)
+        preflight_restore_local
+        if test $status -eq 0
+            report_add_step "OK" "Preflight restore-local" "$step_started"
+        else
+            report_add_step "ERRO" "Preflight restore-local" "$step_started"
+            print_execution_report
+            exit 1
+        end
+
+        set step_started (now_ts)
+        set -l restore_source (resolve_restore_source "$RESTORE_INPUT")
+        or begin
+            report_add_step "ERRO" "Resolver origem do restore" "$step_started"
+            echo "Nao foi possivel identificar um backup para restore."
+            echo "Informe um diretorio ou arquivo .tar.gz."
+            print_execution_report
+            exit 1
+        end
+        report_add_step "OK" "Resolver origem do restore" "$step_started"
+
+        set step_started (now_ts)
         run_restore "$restore_source" "$RESTORE_URI"
+        if test $status -eq 0
+            report_add_step "OK" "Restore local" "$step_started"
+        else
+            report_add_step "ERRO" "Restore local" "$step_started"
+            print_execution_report
+            exit 1
+        end
         echo "Restore concluido com sucesso."
+        print_execution_report
 
     case '*'
         echo "Comando invalido: $CMD"
